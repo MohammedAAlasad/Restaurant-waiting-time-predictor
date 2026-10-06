@@ -6,4 +6,4 @@ __pycache__/
 restaurant.db
 test_restaurant.db
 
-.env
+.env*.db

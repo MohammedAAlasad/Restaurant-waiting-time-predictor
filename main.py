@@ -1,136 +1,135 @@
-from fastapi import FastAPI , HTTPException
-from pydantic import BaseModel , Field
-
-import pandas as pd
 import joblib
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from datetime import datetime, timezone
 
-import holidays
+import database as db
+import events
+from prediction import predict_wait
+from schemas import (EmployeesIn, LocationIn, OrderCreate, OrderOut, OrderStatusOut,
+                     PredictIn, PredictOut, QueueOut)
 from weather import get_weather
 
-from zoneinfo import ZoneInfo
-from datetime import datetime
+db.init_db()
+model = joblib.load("waiting_time_model.joblib")
+app = FastAPI(title="TimePred API")
 
-from database import get_customers_in_queue, get_employees_working,get_avg_service_time, get_orders_last_30min
-from database import create_order , start_order , end_order , update_employees_working
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],     
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-app = FastAPI()
-model = joblib.load('waiting_time_model.joblib')
 
-class EmployeesUpdate(BaseModel):
-    employees_working: int = Field(ge=1)
+def require_restaurant(restaurant_id: int) -> dict:
+    restaurant = db.get_restaurant(restaurant_id)
+    if not restaurant:
+        raise HTTPException(404, "Restaurant not found")
+    return restaurant
+
+
+def change_state(order_id: int, action) -> dict:
+    if db.get_order(order_id) is None:
+        raise HTTPException(404, "Order not found")
+    if action(order_id) == 0:
+        raise HTTPException(409, "That order is not in a state where this action is allowed")
+    events.notify()
+    return db.get_order(order_id)
+
 
 @app.get("/")
 def home():
-    return {"message" : "TimePred API is running"}
-
-@app.post("/predict")
-def predict():
-    customers_in_queue = get_customers_in_queue()
-    employees_working = get_employees_working()
-    avg_service_time = get_avg_service_time()
-    orders_last_30min = get_orders_last_30min()
-
-    now = datetime.now(ZoneInfo("America/Los_Angeles"))
-    temperature, weather = get_weather()
-
-    warnings = []
-
-    us_holidays = holidays.US(years=now.year)
-    is_holiday = 1 if now.date() in us_holidays else 0
-
-    hour = now.hour
-    day_of_week = now.strftime("%A")
-    is_weekend = 1 if day_of_week in ["Saturday", "Sunday"] else 0
-    
-    new_data = pd.DataFrame(
-    [{
-        "day_of_week": day_of_week,
-        "hour": hour,
-        "is_weekend": is_weekend,
-        "is_holiday": is_holiday,
-        "temperature": temperature,
-        "weather": weather,
-        "customers_in_queue": customers_in_queue,
-        "employees_working": employees_working,
-        "avg_service_time": avg_service_time,
-        "orders_last_30min": orders_last_30min
-    }]
-    )
-
-    if customers_in_queue > 31:
-        warnings.append(
-            "customers_in_queue is outside the training range"
-        )
-
-    if employees_working > 9:
-        warnings.append(
-            "employees_working is outside the training range"
-        )
-
-    if avg_service_time < 2.09 or avg_service_time > 10.68:
-        warnings.append(
-            "avg_service_time is outside the training range"
-        )
-
-    if orders_last_30min > 61:
-        warnings.append(
-            "orders_last_30min is outside the training range"
-        )
+    return {"message": "TimePred API is running"}
 
 
-    pred = model.predict(new_data)
+@app.post("/orders", response_model=OrderOut, status_code=201)
+def create_order(body: OrderCreate | None = None):
+    body = body or OrderCreate()
+    require_restaurant(body.restaurant_id)
+    order = db.create_order(body.restaurant_id, body.item_count)
+    events.notify()
+    return order
+
+
+@app.put("/orders/{order_id}/start", response_model=OrderOut)
+def start_order(order_id: int):
+    return change_state(order_id, db.start_order)
+
+
+@app.put("/orders/{order_id}/complete", response_model=OrderOut)
+def complete_order(order_id: int):
+    return change_state(order_id, db.complete_order)
+
+
+@app.get("/orders/{order_id}/status", response_model=OrderStatusOut)
+def order_status(order_id: int):
+    order = db.get_order(order_id)
+    if not order:
+        raise HTTPException(404, "Order not found")
+    restaurant = require_restaurant(order["restaurant_id"])
+
+    if order["status"] == "COMPLETED":
+        return {"id": order_id, "status": "COMPLETED", "orders_ahead": 0, "eta_minutes": 0}
+
+    if order["status"] == "IN_PROGRESS":
+        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(order["started_at"])).total_seconds() / 60
+        eta = max(1.0, db.avg_service_minutes(restaurant["id"]) - elapsed)
+        return {"id": order_id, "status": "IN_PROGRESS", "orders_ahead": 0, "eta_minutes": round(eta, 1)}
+
+    ahead_waiting = db.waiting_ahead_of(order)
+    _, in_progress = db.queue_counts(restaurant["id"])
+    eta = predict_wait(model, restaurant, waiting=ahead_waiting)["predicted_waiting_time"]
+    return {"id": order_id, "status": "CREATED", "orders_ahead": ahead_waiting + in_progress, "eta_minutes": eta}
+
+
+@app.get("/queue", response_model=QueueOut)
+def get_queue(restaurant_id: int = 1):
+    restaurant = require_restaurant(restaurant_id)
     return {
-        "predicted_waiting_time":max(0, float(pred[0])),
-        "warnings": warnings
-        }
-    
-
-@app.post("/orders")
-def create_order_endpoint():
-    create_order()
-
-    return {
-        "message": "Order created successfully"
-    } 
-
-@app.put("/orders/{order_id}/start")
-def start_order_endpoint(order_id: int):
-    row_chnage_result = start_order(order_id)
-    if row_chnage_result == 1:
-        return {
-            "message": "Order started successfully"
-        } 
-    else:
-        raise HTTPException(
-        status_code=404,
-        detail="Order not found"
-    )
-
-@app.put("/orders/{order_id}/complete")
-def complete_order_endpoint(order_id: int):
-    row_chnage_result = end_order(order_id)
-    if row_chnage_result == 1:
-        return {
-            "message": "Order ended successfully"
-        } 
-    else:
-        raise HTTPException(
-        status_code=404,
-        detail="Order not found"
-    )
-
-    
-@app.put("/employees")
-def update_employees(data: EmployeesUpdate):
-    up_emp = update_employees_working(data.employees_working)
-    if up_emp == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Restaurant info not found"
-        )
-
-    return {
-        "message": "Employee count edited successfully"
+        "orders": db.list_queue_orders(restaurant_id, restaurant["timezone"]),
+        "employees_working": restaurant["employees_working"],
     }
 
-        
+
+@app.put("/employees")
+def update_employees(body: EmployeesIn):
+    require_restaurant(body.restaurant_id)
+    db.set_employees(body.restaurant_id, body.employees_working)
+    events.notify()
+    return {"message": "Employee count updated", "employees_working": body.employees_working}
+
+
+@app.put("/restaurant/location")
+def update_location(body: LocationIn):
+    require_restaurant(body.restaurant_id)
+    try:
+        timezone_name = get_weather(body.latitude, body.longitude)["timezone"]
+    except Exception:
+        raise HTTPException(502, "Could not look up the timezone for these coordinates. Try again.")
+    db.set_location(body.restaurant_id, body.latitude, body.longitude, timezone_name)
+    events.notify()
+    return {"latitude": body.latitude, "longitude": body.longitude, "timezone": timezone_name}
+
+
+@app.post("/predict", response_model=PredictOut)
+def predict(body: PredictIn | None = None):
+    body = body or PredictIn()
+    restaurant = require_restaurant(body.restaurant_id)
+    return predict_wait(model, restaurant, lat=body.latitude, lon=body.longitude)
+
+
+@app.get("/analytics/hourly")
+def analytics_hourly(restaurant_id: int = 1):
+    restaurant = require_restaurant(restaurant_id)
+    return db.hourly_analytics(restaurant_id, restaurant["timezone"])
+
+
+@app.get("/events")
+async def events_stream(request: Request):
+    return StreamingResponse(
+        events.event_stream(request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
