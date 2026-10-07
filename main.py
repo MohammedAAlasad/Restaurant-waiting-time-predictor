@@ -17,7 +17,7 @@ app = FastAPI(title="TimePred API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],     
+    allow_origins=["http://localhost:5173" , "http://127.0.0.1:5173"],     
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -79,9 +79,8 @@ def order_status(order_id: int):
         return {"id": order_id, "status": "IN_PROGRESS", "orders_ahead": 0, "eta_minutes": round(eta, 1)}
 
     ahead_waiting = db.waiting_ahead_of(order)
-    _, in_progress = db.queue_counts(restaurant["id"])
     eta = predict_wait(model, restaurant, waiting=ahead_waiting)["predicted_waiting_time"]
-    return {"id": order_id, "status": "CREATED", "orders_ahead": ahead_waiting + in_progress, "eta_minutes": eta}
+    return {"id": order_id, "status": "CREATED", "orders_ahead": ahead_waiting , "eta_minutes": eta}
 
 
 @app.get("/queue", response_model=QueueOut)

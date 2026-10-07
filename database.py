@@ -43,7 +43,8 @@ def utc_now() -> str:
 @contextmanager
 def connect():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row         
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -133,16 +134,13 @@ def list_queue_orders(restaurant_id: int, tz_name: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def queue_counts(restaurant_id: int) -> tuple[int, int]:
+def queue_counts(restaurant_id: int) -> int:
     with connect() as conn:
-        rows = conn.execute(
-            """SELECT status, COUNT(*) AS n FROM orders
-               WHERE restaurant_id = ? AND status IN ('CREATED')
-               GROUP BY status""",
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE restaurant_id = ? AND status = 'CREATED'",
             (restaurant_id,),
-        ).fetchall()
-    counts = {r["status"]: r["n"] for r in rows}
-    return counts.get("CREATED", 0), counts.get("IN_PROGRESS", 0)
+        ).fetchone()
+    return row["n"]
 
 
 def waiting_ahead_of(order: dict) -> int:

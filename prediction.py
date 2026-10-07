@@ -29,7 +29,7 @@ def predict_wait(model, restaurant: dict, lat=None, lon=None, waiting: int | Non
     else:
         warnings.append("no location set; using typical weather")
 
-    queue_waiting, _ = db.queue_counts(rid)
+    queue_waiting = db.queue_counts(rid)
     customers_in_queue = queue_waiting if waiting is None else waiting
     employees = restaurant["employees_working"]
     avg_service = db.avg_service_minutes(rid)
